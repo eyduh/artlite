@@ -5,6 +5,7 @@ llama.cpp's residual after the slice; then decode steps (the overlay) continuing
 states), against llama.cpp and against the same overlay running every position as a decode step. Occamy 1.0 APEX: its
 IQ3_XXS experts (layers 20 .. 23) and its Q3_K ones (layers 4 .. 7)."""
 
+import glob
 import os
 
 import numpy as np
@@ -12,6 +13,7 @@ import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
+from artlite.model_config import QwenConfig
 
 from ..common import essay
 from . import ref
@@ -75,3 +77,53 @@ def test_prefill_slice(size: str, La: int) -> None:
     else:
         assert np.max(err) < 8e-2 and np.mean(err) < max(1.5e-2, 1.3 * np.mean(dec))
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3
+
+
+def _peculiar_ragdoll_path() -> str | None:
+    """A cached peculiar-ragdoll Tiel/Cyber-Tiel 35B-A3B GGUF, if present."""
+    hub = os.path.expanduser("~/.cache/huggingface/hub")
+    for pat in ("models--peculiar-ragdoll--*Tiel*", "models--peculiar-ragdoll--*Cyber*Tiel*"):
+        for d in glob.glob(os.path.join(hub, pat)):
+            for f in glob.glob(os.path.join(d, "snapshots", "*", "*.gguf")):
+                if "mmproj" not in f:
+                    return f
+    return None
+
+
+def test_peculiar_ragdoll_q8_gate_up_half_group() -> None:
+    """The peculiar-ragdoll 35B-A3B files put some gate/up weights in Q8_0 tiles. Q8_0's prefill dequant kernel does not
+    yet support the two-half SiLU-group pass (halves=2), so the planner must choose half a group (halves=1)."""
+    from models.qwen35.image import QwenImage
+    from models.qwen35.overlay import QwenOverlay
+    from models.qwen35.prefill import QwenPrefill
+
+    path = _peculiar_ragdoll_path()
+    if path is None:
+        pytest.skip("no peculiar-ragdoll Tiel/Cyber-Tiel GGUF in cache")
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    if not cfg.moe:
+        pytest.skip("test targets MoE qwen35 models")
+    img = QwenImage(g, cfg)
+    ov = QwenOverlay(g, layers=img.layers)
+    pf = QwenPrefill(ov)
+    for T in pf.sz:
+        for L in pf.layers:
+            gemms = pf.moe.gemms(L, T)
+            for gemm in (gemms.sgu,):
+                op = gemm.op
+                if op.fmt == "Q8_0":
+                    assert op.halves == 1, (path, T, L, op.halves, op.tiles, op.TR)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("path", [_peculiar_ragdoll_path()], ids=["peculiar-ragdoll"])
+def test_peculiar_ragdoll_npu_init(path: str | None) -> None:
+    """``NpuQwen`` renders and packs the prefill ELFs for a peculiar-ragdoll 35B-A3B GGUF (host + NPU compile)."""
+    from models.qwen35.qwen import NpuQwen
+
+    if path is None or not os.path.exists(path):
+        pytest.skip("no peculiar-ragdoll Tiel/Cyber-Tiel GGUF in cache")
+    g = GGUFFile(path)
+    model = NpuQwen(g)
+    assert model.prefill is not None

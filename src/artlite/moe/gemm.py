@@ -66,7 +66,11 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
     per = width // COLS  # (outputs per column)
     pl = planar(b.fmt, b.R, region.kc)
     # (tiles and outputs per pass: 4 x [8 gate | 8 up] rows, 32 outputs; planar: a SiLU group, 64)
-    tp, w = (gu_tiles(b.R), PASS) if pl else (PASS // b.R, PASS // 2)
+    # Q8_0's dequant kernel does not yet support halves=2: use half a SiLU group (64 rows, PASS // 2 outputs).
+    q80 = b.fmt == "Q8_0"
+    tp, w = ((gu_tiles(b.R) // 2, PASS // 2) if pl and q80 else
+             (gu_tiles(b.R), PASS) if pl else
+             (PASS // b.R, PASS // 2))
     passes = b.tiles // tp
     assert passes * w == per, (passes, per)
     kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": region.K, "N": width, "tile_bytes": region.tile_bytes,

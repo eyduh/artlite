@@ -237,7 +237,10 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     if name == "gate_up":
         (b,) = region.blocks
         if is_planar(b.fmt, b.R, KC):  # (a pass: one group of 8 x [8 gate | 8 up] rows, 64 outputs, in two halves)
-            tp, width = gu_tiles(b.R), 64
+            # Q8_0's dequant kernel supports only one whole group of whole tiles (halves=1); use half a SiLU group
+            # (64 rows, 32 outputs) so the pass stays halves=1.
+            q80 = b.fmt == "Q8_0"
+            tp, width = ((gu_tiles(b.R) // 2, 32) if q80 else (gu_tiles(b.R), 64))
         else:  # (a pass: 64 rows, 4 x [8 gate | 8 up]: 4 Q4_K tiles, 8 BFP16 tiles)
             tp, width = _tp(b), 32
         passes = b.tiles // tp
