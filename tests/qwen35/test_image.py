@@ -4,6 +4,7 @@ column-major where the decode's K groups allow it; an MoE file's router planes, 
 packed image's tiles and norm-weight objects at their places (the C++ packer against the slots' ``pack_tile``:
 decode/test_gemv.py), an MoE's experts against the oracle's matrices (``ref.experts``)."""
 
+import glob
 import os
 
 import numpy as np
@@ -20,7 +21,8 @@ from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
 from .ref import QwenConfig, experts, qwen_gguf
 
-S = 9280
+S = 9280  # the default tile_bytes of the base Qwen3.5 / 3.6 / 3.8 files (Q4_K_M)
+PECULIAR = 9792  # the tile_bytes of peculiar-ragdoll's Unsloth Dynamic 3.0 35B-A3B quants
 MOE = qwen_gguf("Q4_K_M", "35B-A3B")
 
 
@@ -32,7 +34,7 @@ def test_layout(size: str) -> None:
     g = GGUFFile(path)
     cfg = QwenConfig.from_gguf(g)
     img = QwenImage(g, cfg)
-    assert img.tile_bytes == S
+    assert img.tile_bytes == S  # base Qwen files use the default 9280-byte object
     assert img.column_major == (size != "27B")  # (the 27B: its output projections' and down's groups are strided)
     if img.column_major:  # a column's regions in a row (each normed phase's norm objects first), one run per block
         names = [r.name for r in img.regions]
@@ -250,6 +252,46 @@ def test_pack_moe() -> None:
             got = QTensor(name="d", qtype=dview.qtype, rows=o.size, cols=F // 2, raw=dview.raw[v[o]]).dequantize().numpy()
             want = down[_group_out(v.size, dn.R, 4)[o], h * F // 2:(h + 1) * F // 2]
             assert np.array_equal(got, want), (L, e, h)
+
+
+def _peculiar_ragdoll_path(name: str) -> str | None:
+    """The local GGUF file under ~/.cache/huggingface/hub for a peculiar-ragdoll repo (ignores mmproj files)."""
+    base = os.path.expanduser("~/.cache/huggingface/hub")
+    for p in glob.glob(os.path.join(base, f"models--{name}", "snapshots", "*", "*.gguf")):
+        if "mmproj" not in p:
+            return p
+    return None
+
+
+@pytest.mark.parametrize("name", ["peculiar-ragdoll--Cyber-Tiel-Coder-35B-A3B-GGUF-MTP",
+                                    "peculiar-ragdoll--Tiel-Coder-35B-A3B-GGUF-MTP"])
+def test_layout_peculiar_ragdoll(name: str) -> None:
+    """Unsloth Dynamic 3.0 quants of Qwen3.6-35B-A3B use a 9792-byte weight / cache object; QwenImage must accept it."""
+    path = _peculiar_ragdoll_path(name)
+    if path is None:
+        pytest.skip(f"{name}: not present")
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    img = QwenImage(g, cfg)
+    assert img.tile_bytes == PECULIAR, img.tile_bytes
+    assert cfg.moe and cfg.num_hidden_layers > 0
+    assert len(img.regions) > 0 and len(img.slabs) > 0
+
+
+@pytest.mark.parametrize("name", ["peculiar-ragdoll--Cyber-Tiel-Coder-35B-A3B-GGUF-MTP",
+                                    "peculiar-ragdoll--Tiel-Coder-35B-A3B-GGUF-MTP"])
+def test_decode_design_peculiar_ragdoll(name: str) -> None:
+    """The 9792-byte object fits the qwen35 decode overlay design (host-only: renders kernel source and MLIR)."""
+    from models.qwen35.overlay import QwenOverlay
+
+    path = _peculiar_ragdoll_path(name)
+    if path is None:
+        pytest.skip(f"{name}: not present")
+    ov = QwenOverlay(GGUFFile(path), max_positions=4096)
+    src = ov.op.kernel_source()
+    mlir = ov.op.mlir_text()
+    assert src is not None and len(src.text) > 0
+    assert len(mlir) > 0
 
 
 def _bfp16_rows(tile: np.ndarray) -> np.ndarray:

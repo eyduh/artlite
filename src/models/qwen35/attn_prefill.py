@@ -67,11 +67,17 @@ from . import attn as AT
 HD = AT.HD
 ND = AT.ND
 SLOT = AT.REC_K  # bytes per head of a token group's Q panels (and of its sigmoid(gate): 4096 B used)
-GROUP = 3 * AT.OBJ_BYTES  # bytes of a cache group (32 positions: two K objects, a V object)
+
+
+def group_bytes(a_bytes: int) -> int:
+    """Bytes of a cache group (32 positions: two K objects, a V object) for a cache / weight object of ``a_bytes``."""
+    return 3 * a_bytes
+
+
 # Scratchpad parameters. QA_KV and QA_OFF are one per operator size ("qa_kv<T>"): a parameter's range is the tightest
 # of the operators that read it, and a smaller chunk may start where a larger one would overrun the cache.
 QA_CS = "qa_cs"  # bf16 offset of the chunk's rows in the cos / sin table (128 p0)
-QA_KV = "qa_kv"  # bf16 offset of the chunk's first cache group (GROUP / 2 * p0 / 32)
+QA_KV = "qa_kv"  # bf16 offset of the chunk's first cache group (group_bytes(a_bytes) / 2 * p0 / 32)
 QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; the cores' count)
 QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
@@ -290,12 +296,13 @@ class AttnPrepOperator(ArtcOperator):
     and head a ``SLOT``, pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head], ``pass_groups``;
     a sub-chunk's part of a chunk's QS contiguous),
     KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
-    of the first token (default p0), ``QA_KV`` (T's) = GROUP / 2 * p0 / 32 (``params``)."""
+    of the first token (default p0), ``QA_KV`` (T's) = ``self.group / 2`` * p0 / 32 (``params``)."""
 
     STACK = 3072
     pfx = kernel_prefix("qap")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int):
+    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int,
+                 a_bytes: int = AT.OBJ_BYTES):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0 and T // 8 <= 64, "whole cache groups; a BD repeats at most 64 times"
@@ -304,7 +311,8 @@ class AttnPrepOperator(ArtcOperator):
         self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
         self.qc = cfg.num_attention_heads // COLS
         assert 1 <= self.qc <= 3, "a core per q head and the KV core in a column"
-        self.head_bytes, self.cs_positions = head_bytes, cs_positions
+        self.head_bytes, self.cs_positions, self.a_bytes = head_bytes, cs_positions, a_bytes
+        self.group = group_bytes(a_bytes)
         self.qg = pass_groups(cfg, T)
         self.two = two_streams(cfg, T)  # (QS's slot layout: ``slot_walk``)
         assert T % (32 * self.qg) == 0
@@ -345,7 +353,7 @@ class AttnPrepOperator(ArtcOperator):
         (default p0)."""
         r = p0 if cs_row is None else cs_row
         assert p0 % 32 == 0 and 0 <= r and r + self.T <= self.cs_positions
-        return {QA_CS: 128 * r, f"{QA_KV}{self.T}": GROUP // 2 * (p0 // 32)}
+        return {QA_CS: 128 * r, f"{QA_KV}{self.T}": self.group // 2 * (p0 // 32)}
 
     def get_mlir_artifact(self) -> Module:
         p, T, qc, lay = self.pfx, self.T, self.qc, self.layout
@@ -416,7 +424,7 @@ class AttnPrepOperator(ArtcOperator):
         n_cs, n_kv = self.cs_positions * 128, self.kvh * self.head_bytes // 2
         nph, per = self.nph, self.per
         n_qs, blk = self.n_qs, 4 * self.qg * qc * SLOT  # (bf16 of a column's slots in a pass)
-        hb, g2, o2 = self.head_bytes // 2, GROUP // 2, AT.OBJ_BYTES // 2
+        hb, g2, o2 = self.head_bytes // 2, self.group // 2, self.a_bytes // 2
 
         def seq(G, CS, NRM, QS, KV, ah, bh, oh, khs):
             kh = dict(zip(k, khs))
@@ -855,14 +863,16 @@ class PrefillAttnOperator(ArtcOperator):
     STACK = 3072
     pfx = kernel_prefix("qaa")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = ()):
+    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (),
+                 a_bytes: int = AT.OBJ_BYTES):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_qk",
         "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters programmed (``COUNTERS``;
         two streams only)."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0
-        self.T, self.cfg, self.head_bytes = T, cfg, head_bytes
+        self.T, self.cfg, self.head_bytes, self.a_bytes = T, cfg, head_bytes, a_bytes
+        self.group = group_bytes(a_bytes)
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
@@ -895,7 +905,7 @@ class PrefillAttnOperator(ArtcOperator):
 
     def params(self, p0: int) -> dict[str, int]:
         assert p0 % 32 == 0
-        return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": GROUP // 2 * (p0 // 32 + 1)}
+        return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": self.group // 2 * (p0 // 32 + 1)}
 
     def get_mlir_artifact(self) -> Module:
         if self.two:
@@ -994,12 +1004,13 @@ class PrefillAttnOperator(ArtcOperator):
                     # group 4 QG][head] one after the other in QS, a token group [Q | sigmoid(gate)][head])
                     q0, k0 = (b * COLS + nph * h) * blk + i * SLOT // 4, h * hb + i * SLOT // 8
                     q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 4], [0, qc * SLOT, sl, 1]
+                    o2 = self.a_bytes // 2
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str)),
-                             ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, SLOT // 8], [0, 4640, SLOT // 4, 1]),
+                             ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, SLOT // 8], [0, o2, SLOT // 4, 1]),
                                        length_parameter=p_n)]
                     if more:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3 * more, 4, SLOT // 8],
-                                                                       [0, 4640, SLOT // 4, 1]),
+                                                                       [0, o2, SLOT // 4, 1]),
                                                offset_parameter=p_off))
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
@@ -1137,12 +1148,13 @@ class PrefillAttnOperator(ArtcOperator):
                     q0 = (b * COLS + nph * h) * blk + (2 * s + i) * SLOT // 8  # (its quarter of the slots: ``slot_walk``)
                     k0, run = h * hb + s * SLOT // 8 + i * SLOT // 16, SLOT // 16
                     q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 8], [0, qc * SLOT, SLOT // 2, 1]
+                    o2 = self.a_bytes // 2
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str)),
-                             ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, run], [0, 4640, SLOT // 4, 1]),
+                             ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3, 4, run], [0, o2, SLOT // 4, 1]),
                                        length_parameter=p_n)]
                     if more:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 3 * more, 4, run],
-                                                                       [0, 4640, SLOT // 4, 1]),
+                                                                       [0, o2, SLOT // 4, 1]),
                                                offset_parameter=p_off))
                     parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)

@@ -102,7 +102,7 @@ class DraftPrefill:
         kv0, hb = d.kv_off[L], d.ash.kvh * d.ash.head_bytes
         qn = f"PQN[{self.pf.qn_off[L]}:{self.pf.qn_off[L] + 4 * 2 * AP.HD}]"
         qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots)
-        grp = t // 32 * AP.GROUP  # (a sub-chunk's cache groups)
+        grp = t // 32 * prep.group  # (a sub-chunk's cache groups)
         rl += [(prep, tok("DG", j, prep, i=0, row=g_rb), sl("PCS", j * t * 256, prep, i=1), qn,
                 sl("QS", j * t // 8 * qs_g, prep, i=3), f"DKV[{kv0 + j * grp}:{kv0 + j * grp + hb}]") for j in range(S)]
         return rl

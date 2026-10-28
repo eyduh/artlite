@@ -29,7 +29,6 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.overlay import Sequence
 
-from .attn import OBJ_BYTES
 from .image import QwenImage
 from .overlay import QwenOverlay
 
@@ -50,10 +49,11 @@ def mtp_config(gguf: GGUFFile) -> QwenConfig:
 class DraftImage(QwenImage):
     """The drafter's weights: per its layer "eh" (``nextn.eh_proj``, rows hidden / 8 c .. over K 2 hidden), then the
     layer's regions (an attention layer and its MoE: ``QwenImage``'s), the head's first ``vocab`` rows normed by
-    ``nextn.shared_head_norm``; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
+    ``nextn.shared_head_norm``; tiles of the target model's object size (default: detected from the drafter file)."""
 
-    def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None):
-        super().__init__(gguf, cfg, layers=layers, vocab=vocab, tile_bytes=OBJ_BYTES)
+    def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None,
+                 tile_bytes: int = 0):
+        super().__init__(gguf, cfg, layers=layers, vocab=vocab, tile_bytes=tile_bytes)
 
     def _layer(self, layer: int) -> None:
         H = self.cfg.hidden_size
@@ -71,10 +71,11 @@ def _formats(img: QwenImage) -> set[str]:
     return {b.fmt for r in img.regions + img.slabs for b in r.blocks}
 
 
-def draft_formats(gguf: GGUFFile, *, vocab: int = HEAD_ROWS) -> tuple[str, ...]:
+def draft_formats(gguf: GGUFFile, *, vocab: int = HEAD_ROWS, tile_bytes: int = 0) -> tuple[str, ...]:
     """The tile formats of a drafter file's image: its model's design runs them (``QwenOverlay(formats=)``)."""
     cfg = mtp_config(gguf)
-    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1], vocab=vocab))))
+    return tuple(sorted(_formats(DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1], vocab=vocab,
+                                          tile_bytes=tile_bytes))))
 
 
 class _DraftConfig:
@@ -96,12 +97,13 @@ class QwenDraft(QwenOverlay):
                 tc.n_experts_used, tc.expert_ffn, tc.shared_ffn):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         self.L = cfg.num_hidden_layers - 1
-        super().__init__(gguf, layers=[self.L], vocab=vocab, max_positions=target.max_positions)
+        super().__init__(gguf, layers=[self.L], vocab=vocab, max_positions=target.max_positions,
+                         tile_bytes=target.img.tile_bytes)
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
         fmts = _formats(self.image)
         if not fmts <= set(target.op.rows):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
-                             f"QwenOverlay(formats=draft_formats(gguf))")
+                             f"QwenOverlay(formats=draft_formats(gguf, tile_bytes=target.img.tile_bytes))")
         self.target, self.op = target, target.op  # (the model's design and hardware context: ``load``)
 
     def _phases(self) -> list[tuple[int, str]]:

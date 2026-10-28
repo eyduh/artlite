@@ -3,6 +3,7 @@ token slots per dispatch: the GEMV phases (normed input projections, output proj
 K groups, gate / up with silu(gate) up, down, the LM head) against the cores' numerics (``mmv.ref_rows``) and
 llama.cpp's projections of the same inputs (golden tensors of a decode run: the slots take the last S tokens)."""
 
+import glob
 import os
 
 import numpy as np
@@ -862,3 +863,28 @@ def test_state_panels() -> None:
     # panel 16 h + jp, sub-panel ib: [jj][ii] = S[i = 8 ib + ii][j = 8 jp + jj] = m[h][j][i]
     assert p[16 * 2 + 5, 64 * 3 + 8 * 4 + 6] == m[2, 8 * 5 + 4, 8 * 3 + 6]
     assert np.array_equal(G.state_from_panels(p, 3), m)
+
+
+def _peculiar_ragdoll_path(name: str) -> str | None:
+    """The local GGUF file under ~/.cache/huggingface/hub for a peculiar-ragdoll repo (ignores mmproj files)."""
+    base = os.path.expanduser("~/.cache/huggingface/hub")
+    for p in glob.glob(os.path.join(base, f"models--{name}", "snapshots", "*", "*.gguf")):
+        if "mmproj" not in p:
+            return p
+    return None
+
+
+@pytest.mark.parametrize("name", ["peculiar-ragdoll--Cyber-Tiel-Coder-35B-A3B-GGUF-MTP",
+                                    "peculiar-ragdoll--Tiel-Coder-35B-A3B-GGUF-MTP"])
+def test_peculiar_ragdoll_decode_design(request: pytest.FixtureRequest, name: str) -> None:
+    """Host-only: the 9792-byte Unsloth Dynamic 3.0 35B-A3B quants fit the qwen35 decode overlay.
+    Run with ``--dump-designs`` to render the design; otherwise the test is skipped to avoid the NPU."""
+    if not request.config.getoption("--dump-designs"):
+        pytest.skip("run with --dump-designs")
+    path = _peculiar_ragdoll_path(name)
+    if path is None:
+        pytest.skip(f"{name}: not present")
+    from models.qwen35.overlay import QwenOverlay
+
+    ov = QwenOverlay(GGUFFile(path), max_positions=4096)
+    ov.op.compile()

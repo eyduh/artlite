@@ -77,8 +77,9 @@ class NpuQwen(OverlayModel):
         cfg = QwenConfig.from_gguf(gguf)
         path = qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
         mtp = GGUFFile(path) if path else None
+        base_img = QwenImage(gguf, cfg, layers=[])
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights,
-                                   formats=draft_formats(mtp) if mtp is not None else ())
+                                   formats=draft_formats(mtp, tile_bytes=base_img.tile_bytes) if mtp is not None else ())
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else None  # (OverlayModel's)

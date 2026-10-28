@@ -120,7 +120,8 @@ class QwenPrefill(ChunkPrefill):
         self.qn_off = {L: i * 4 * 2 * AP.HD for i, L in enumerate(self.att + ([draft.L] if draft is not None else []))}
         # (an MTP drafter's cache records of the prompt: ``draft_prefill``)
         self.dp = DraftPrefill(draft, self) if draft is not None else None
-        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes) for T in self.sizes} \
+        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes,
+                                                a_bytes=overlay.ash.a_bytes) for T in self.sizes} \
             if self.att else {}
         self._starts: dict[int, list[int]] = {}
         self._rows()
@@ -193,7 +194,7 @@ class QwenPrefill(ChunkPrefill):
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
         """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""
         return self._op(AP.AttnPrepOperator, lay, T=self._t(T), head_bytes=self.ov.ash.head_bytes,
-                        cs_positions=self.ov.max_positions + SUB)
+                        cs_positions=self.ov.max_positions + SUB, a_bytes=self.ov.ash.a_bytes)
 
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
@@ -253,7 +254,7 @@ class QwenPrefill(ChunkPrefill):
                 kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
                 qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots: QS pass-major)
-                grp = t // 32 * AP.GROUP  # (a sub-chunk's cache groups)
+                grp = t // 32 * prep.group  # (a sub-chunk's cache groups)
                 rl += [(prep, tok("G", j, prep, i=0, row=g_rb), sl("PCS", j * t * 256, prep, i=1), qn,
                         sl("QS", j * t // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")
                        for j in range(S)]

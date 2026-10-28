@@ -22,7 +22,7 @@ from ml_dtypes import bfloat16
 
 from artlite.decode import design as OD
 from artlite.decode import gemv
-from artlite.decode.design import C_LEN, META, NX_PER_NORM, XPAY, DecodeOverlayOperator, _Streams
+from artlite.decode.design import C_LEN, META, NX_PER_NORM, DecodeOverlayOperator, _Streams
 from artlite.operators.design import COLS, range32
 
 from . import attn as AT
@@ -34,8 +34,9 @@ M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_ATREC, M_NTAIL = range(OD.M_MODEL + 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
     """The qwen35 decode overlay design (module docstring): ``rows``: {tile format: rows per tile} of tiles of 1024
-    columns (``tile_bytes`` 9280; formats the decode GEMV reads, ``gemv.supported``); ``gdn``, ``attn``: the shapes of the GDN and attention cores
-    (None: without)."""
+    columns (``tile_bytes``: a weight / cache object size that the attention records pack into 32 positions, e.g. 9280
+    or 9792; formats the decode GEMV reads, ``gemv.supported``); ``gdn``, ``attn``: the shapes of the GDN and attention
+    cores (None: without)."""
 
     PREFIX = "q35m"
     GDN_STACK, ATTN_STACK = 4864, 3456
@@ -47,8 +48,9 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         """moe: (experts, experts per token) of an MoE model (``decode.design``'s "MoE"; its router's BFP16 tiles),
         max_k: the K of a phase's group at most; paged: formats whose kernels are code pages (``decode.model.paged_formats``:
         a drafter's Q4_0 beside the model's three)."""
-        assert all(gemv.supported(f, 4) for f in rows) and tile_bytes == AT.OBJ_BYTES, rows
-        assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == XPAY and gdn.meta == META)
+        assert all(gemv.supported(f, 4) for f in rows), rows
+        assert AT.REC.pg(tile_bytes) == AT.POS_PER_GROUP, tile_bytes
+        assert gdn is None or (gdn.c_len == C_LEN and gdn.xpay == OD.XPAY and gdn.meta == META)
         assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == tile_bytes)
         self.gdn, self.attn = gdn, attn
         self.msg, self.relay = gdn is not None, attn is not None
